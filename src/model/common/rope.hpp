@@ -842,43 +842,80 @@ namespace Rope {
         return embed_nd(ids, bs, static_cast<float>(theta), axes_dim, wrap_dims);
     }
 
-    __STATIC_INLINE__ ggml_tensor* apply_rope(ggml_context* ctx,
-                                              ggml_tensor* x,
-                                              ggml_tensor* pe,
-                                              bool rope_interleaved = true) {
-        // x: [N, L, n_head, d_head]
-        // pe: [L, d_head/2, 2, 2], [[cos, -sin], [sin, cos]]
+
+    // CPU fallback for the fused Flux-RoPE custom op.
+    // x (src[0]): [D, L, B] contiguous, interleaved even/odd pairs
+    // pe (src[1]): [D, L] contiguous, pe[l*D+2p]=cos, pe[l*D+2p+1]=-sin
+    static void flux_rope_cpu_fn(ggml_tensor* dst, int ith, int nth, void* userdata) {
+        (void)ith; (void)nth; (void)userdata;
+        const ggml_tensor* x  = dst->src[0];
+        const ggml_tensor* pe = dst->src[1];
+        const int64_t D = x->ne[0];
+        const int64_t L = x->ne[1];
+        const int64_t B = x->ne[2];
+        const float* x_data  = (const float*)x->data;
+        const float* pe_data = (const float*)pe->data;
+        float* dst_data      = (float*)dst->data;
+        for (int64_t b = 0; b < B; b++) {
+            for (int64_t l = 0; l < L; l++) {
+                for (int64_t p = 0; p < D / 2; p++) {
+                    const float xe = x_data[b*L*D + l*D + 2*p];
+                    const float xo = x_data[b*L*D + l*D + 2*p + 1];
+                    const float c  = pe_data[l*D + 2*p];       // cos
+                    const float ns = pe_data[l*D + 2*p + 1];   // -sin
+                    dst_data[b*L*D + l*D + 2*p]     = xe * c - xo * ns;
+                    dst_data[b*L*D + l*D + 2*p + 1] = xe * ns + xo * c;
+                }
+            }
+        }
+    }
+
+    __STATIC_INLINE__ struct ggml_tensor* apply_rope(struct ggml_context* ctx,
+                                                     struct ggml_tensor* x,
+                                                     struct ggml_tensor* pe,
+                                                     bool rope_interleaved = true) {
+        // x: [N, L, n_head, d_head]  (GGML ne: [d_head, n_head, L, N])
+        // pe: [L, d_head/2, 2, 2], [[cos, -sin], [sin, cos]]  (GGML ne: [2, 2, d_head/2, L])
         int64_t d_head = x->ne[0];
         int64_t n_head = x->ne[1];
         int64_t L      = x->ne[2];
         int64_t N      = x->ne[3];
-        x              = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N, n_head, L, d_head]
-        if (rope_interleaved) {
-            x = ggml_reshape_4d(ctx, x, 2, d_head / 2, L, n_head * N);  // [N * n_head, L, d_head/2, 2]
-            x = ggml_cont(ctx, ggml_permute(ctx, x, 3, 0, 1, 2));       // [2, N * n_head, L, d_head/2]
-        } else {
-            x = ggml_reshape_4d(ctx, x, d_head / 2, 2, L, n_head * N);       // [N * n_head, L, 2, d_head/2]
-            x = ggml_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 3, 1));  // [2, N * n_head, L, d_head/2]
-        }
 
-        int64_t offset = x->nb[2] * x->ne[2];
-        auto x_0       = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 0);  // [N * n_head, L, d_head/2]
-        auto x_1       = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 1);  // [N * n_head, L, d_head/2]
-        x_0            = ggml_reshape_4d(ctx, x_0, 1, x_0->ne[0], x_0->ne[1], x_0->ne[2]);                    // [N * n_head, L, d_head/2, 1]
-        x_1            = ggml_reshape_4d(ctx, x_1, 1, x_1->ne[0], x_1->ne[1], x_1->ne[2]);                    // [N * n_head, L, d_head/2, 1]
-        auto temp_x    = ggml_new_tensor_4d(ctx, x_0->type, 2, x_0->ne[1], x_0->ne[2], x_0->ne[3]);
-        x_0            = ggml_repeat(ctx, x_0, temp_x);  // [N * n_head, L, d_head/2, 2]
-        x_1            = ggml_repeat(ctx, x_1, temp_x);  // [N * n_head, L, d_head/2, 2]
+        // Fused Flux-RoPE: avoids large ggml_repeat temporaries that cause OOM.
+        // Both interleaved and non-interleaved use the same kernel by converting
+        // to interleaved format first, then un-interleaving the output if needed.
 
-        pe        = ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));  // [2, L, d_head/2, 2]
-        offset    = pe->nb[2] * pe->ne[2];
-        auto pe_0 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 0);  // [L, d_head/2, 2]
-        auto pe_1 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 1);  // [L, d_head/2, 2]
+        // Prepare x: [d_head, n_head, L, N] -> [d_head, L, n_head*N]
+        auto x_prep = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [d_head, L, n_head, N]
+        x_prep = ggml_reshape_3d(ctx, x_prep, d_head, L, n_head * N);    // [D, L, B]
 
-        auto x_out = ggml_add_inplace(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));  // [N * n_head, L, d_head/2, 2]
         if (!rope_interleaved) {
-            x_out = ggml_cont(ctx, ggml_permute(ctx, x_out, 1, 0, 2, 3));  // [N * n_head, L, x, d_head/2]
+            // Non-interleaved x has layout [x0..x_{D/2-1}, y0..y_{D/2-1}] per row.
+            // Convert to interleaved [x0, y0, x1, y1, ...] so the kernel can process it.
+            x_prep = ggml_reshape_4d(ctx, x_prep, d_head / 2, 2, L, n_head * N);  // [B, L, 2, d_head/2]
+            x_prep = ggml_cont(ctx, ggml_permute(ctx, x_prep, 1, 0, 2, 3));       // [B, L, d_head/2, 2]
+            x_prep = ggml_reshape_3d(ctx, x_prep, d_head, L, n_head * N);         // [D, L, B] interleaved
         }
+
+        // Prepare pe: extract first row of each 2x2 rotation matrix
+        // pe ne: [2, 2, d_head/2, L] → view selecting row 0 → [2, d_head/2, L] → [d_head, L]
+        auto pe_prep = ggml_view_3d(ctx, pe, 2, d_head / 2, L,
+                                    pe->nb[2], pe->nb[3], 0);  // [2, d_head/2, L] (strided)
+        pe_prep = ggml_cont(ctx, pe_prep);                      // make contiguous
+        pe_prep = ggml_reshape_2d(ctx, pe_prep, d_head, L);    // [D, L]
+
+        // 0x464C5530 = Flux-RoPE interleaved tag (matched by metalium backend)
+        ggml_tensor* args[2] = {x_prep, pe_prep};
+        auto x_out = ggml_custom_4d(ctx, GGML_TYPE_F32, d_head, L, n_head * N, 1,
+                                    args, 2, flux_rope_cpu_fn, 1,
+                                    (void*)(uintptr_t)0x464C5530);
+
+        if (!rope_interleaved) {
+            // Un-interleave output back to [first_half, second_half] layout
+            x_out = ggml_reshape_4d(ctx, x_out, 2, d_head / 2, L, n_head * N);  // [B, L, d_head/2, 2]
+            x_out = ggml_cont(ctx, ggml_permute(ctx, x_out, 1, 0, 2, 3));       // [B, L, 2, d_head/2]
+        }
+
         x_out = ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);  // [N*n_head, L, d_head]
         return x_out;
     }

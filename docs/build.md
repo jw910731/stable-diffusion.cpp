@@ -196,3 +196,24 @@ cmake .. -DSD_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SY
 
 cmake --build . --config Release
 ```
+
+
+## Build with Tenstorrent Metalium
+
+Using Metalium makes the computation run on the Tenstorrent hardwares. Make sure TT_METAL_HOME is set to the path to tt-metal, and tt-metal project is properly built with steps in official documents.
+
+```shell
+export TT_METAL_HOME=/path/to/tt-metal
+
+cmake .. -DSD_METALIUM=ON -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=1 -DSD_BUILD_SHARED_GGML_LIB=1
+
+cmake --build .
+```
+
+Note that you should set TT_METAL_RUNTIME_ROOT when running, the value should be the same as TT_METAL_HOME environment variable.
+
+```
+export TT_METAL_RUNTIME_ROOT=$TT_METAL_HOME
+
+bin/sd-cli
+```

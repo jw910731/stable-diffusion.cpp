@@ -107,6 +107,11 @@ if(SD_CUDA)
     set(GGML_CUDA ON)
 endif()
 
+if(SD_METALIUM)
+    message("-- Use Tenstorrent Metalium as backend stable-diffusion")
+    set(GGML_METALIUM ON)
+endif()
+
 if(SD_METAL)
     message("-- Use Metal as backend stable-diffusion")
     set(GGML_METAL ON)
