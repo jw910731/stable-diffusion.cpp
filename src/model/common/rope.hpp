@@ -863,8 +863,8 @@ namespace Rope {
                     const float xo = x_data[b*L*D + l*D + 2*p + 1];
                     const float c  = pe_data[l*D + 2*p];       // cos
                     const float ns = pe_data[l*D + 2*p + 1];   // -sin
-                    dst_data[b*L*D + l*D + 2*p]     = xe * c - xo * ns;
-                    dst_data[b*L*D + l*D + 2*p + 1] = xe * ns + xo * c;
+                    dst_data[b*L*D + l*D + 2*p]     = xe * c + xo * ns;  // xe*cos - xo*sin
+                    dst_data[b*L*D + l*D + 2*p + 1] = xo * c - xe * ns;  // xe*sin + xo*cos
                 }
             }
         }
