@@ -113,6 +113,7 @@ endif()
 if(SD_METALIUM)
     message("-- Use Tenstorrent Metalium as backend stable-diffusion")
     set(GGML_METALIUM ON)
+    set(GGML_METALIUM_TTPRM ON)
 endif()
 
 if(SD_METAL)
