@@ -341,6 +341,74 @@ namespace WAN {
         int64_t factor_s;
         int64_t factor;
         int64_t repeats;
+        std::map<std::pair<int64_t, int64_t>, std::vector<float>> row_mask_data;
+
+        // [W, H, 1, IC] -> [W, H, 1, OC], output channel oc taken from input channel (oc * factor + d) / repeats
+        ggml_tensor* select_channels(GGMLRunnerContext* ctx, ggml_tensor* x, int64_t d) {
+            const int64_t W = x->ne[0];
+            const int64_t H = x->ne[1];
+            if (factor % repeats == 0) {
+                const int64_t stride = factor / repeats;
+                if (stride == 1) {
+                    return x;
+                }
+                x = ggml_reshape_4d(ctx->ggml_ctx, x, W, H, stride, out_channels);
+                return ggml_ext_slice(ctx->ggml_ctx, x, 2, d / repeats, d / repeats + 1, false);
+            }
+            x = ggml_repeat_4d(ctx->ggml_ctx, x, W, H, repeats / factor, in_channels);
+            return ggml_reshape_4d(ctx->ggml_ctx, x, W, H, 1, out_channels);
+        }
+
+        // 0/1 over the upscaled rows, selecting sub-row i of every factor_s rows
+        ggml_tensor* row_mask(GGMLRunnerContext* ctx, int64_t rows, int64_t i) {
+            std::vector<float>& data = row_mask_data[{rows, i}];
+            if (data.empty()) {
+                data.resize(rows);
+                for (int64_t r = 0; r < rows; r++) {
+                    data[r] = r % factor_s == i ? 1.f : 0.f;
+                }
+            }
+            ggml_tensor* mask = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F32, 1, rows, 1, 1);
+            ctx->bind_backend_tensor_data(mask, data.data());
+            return mask;
+        }
+
+        // Output pixel (oc, t * factor_t + a, h * factor_s + i, w * factor_s + j) of the chain in forward() is input
+        // channel (((oc * factor_t + a) * factor_s + i) * factor_s + j) / repeats at (t, h, w). For a single frame that
+        // is a channel selection plus a nearest upscale, which avoids the chain's permutes through size-factor_s
+        // innermost dims; tiled backends pay for those in padding and relayout. Returns nullptr where it does not apply.
+        ggml_tensor* forward_single_frame(GGMLRunnerContext* ctx, ggml_tensor* x, bool first_chunk) {
+            const int64_t W   = x->ne[0];
+            const int64_t H   = x->ne[1];
+            const int64_t fs2 = factor_s * factor_s;
+            if (x->ne[2] != 1 || (factor % repeats != 0 && repeats % factor != 0)) {
+                return nullptr;
+            }
+            // With repeats below factor_s^2 the source channel also changes with the row inside each block.
+            const bool per_row = repeats % fs2 != 0;
+            if (per_row && (repeats % factor_s != 0 || !ctx->set_backend_tensor_data)) {
+                return nullptr;
+            }
+            x = ggml_ext_cont(ctx->ggml_ctx, x);
+
+            ggml_tensor* out = nullptr;
+            for (int64_t a = first_chunk ? factor_t - 1 : 0; a < factor_t; a++) {
+                ggml_tensor* frame = nullptr;
+                if (!per_row) {
+                    frame = select_channels(ctx, x, a * fs2);
+                } else {
+                    for (int64_t i = 0; i < factor_s; i++) {
+                        ggml_tensor* rows = select_channels(ctx, x, a * fs2 + i * factor_s);
+                        rows              = ggml_interpolate(ctx->ggml_ctx, rows, W, H * factor_s, 1, out_channels, GGML_SCALE_MODE_NEAREST);
+                        rows              = ggml_mul(ctx->ggml_ctx, rows, row_mask(ctx, H * factor_s, i));
+                        frame             = frame == nullptr ? rows : ggml_add(ctx->ggml_ctx, frame, rows);
+                    }
+                }
+                frame = ggml_interpolate(ctx->ggml_ctx, frame, W * factor_s, H * factor_s, 1, out_channels, GGML_SCALE_MODE_NEAREST);
+                out   = out == nullptr ? frame : ggml_concat(ctx->ggml_ctx, out, frame, 2);
+            }
+            return out;
+        }
 
     public:
         DupUp3D(int64_t in_channels, int64_t out_channels, int64_t factor_t, int64_t factor_s = 1)
@@ -356,6 +424,9 @@ namespace WAN {
             // x: [B*IC, T, H, W]
             // return: [B*OC, T/factor_t, H/factor_s, W/factor_s]
             GGML_ASSERT(B == 1);
+            if (ggml_tensor* out = forward_single_frame(ctx, x, first_chunk)) {
+                return out;
+            }
             int64_t C = x->ne[3];
             int64_t T = x->ne[2];
             int64_t H = x->ne[1];
